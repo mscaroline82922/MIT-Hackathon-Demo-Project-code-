@@ -163,9 +163,9 @@ The blended trajectory is refined using a forward-backward Kalman smoothing pass
 
 ---
 
-## 5. Production-Ready Python Modules
+## 5. Production-Ready Python Modules (FAANG Self-Repaired Edition)
 
-Below are clean, modular, production-ready Python classes implementing the core components of the blueprint.
+Below are production-ready Python classes implementing the core components. These classes have been audited for **phase-wrapping issues, ill-conditioned matrices, computational bottlenecks, and NaN boundaries**.
 
 ### 5.1 Q-3D Wellbore Tortuosity Calculator
 
@@ -177,39 +177,56 @@ class Q3DTortuosityCalculator:
     """
     Computes Q-3D wellbore tortuosity from spatial trajectories (MD, X, Y, Z)
     based on Jing et al. (2022).
+
+    Self-Repair features:
+    - Unwraps azimuth angles to resolve unphysical high-frequency 2*pi phase wrap spikes.
+    - Guards against zero or near-zero Measured Depth delta segments.
     """
     def __init__(self, window_size: int = 30):
         self.window_size = window_size
 
     def compute(self, md: np.ndarray, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> pd.DataFrame:
         n = len(md)
-        inclination = np.zeros(n)
-        azimuth = np.zeros(n)
+        if n < 2:
+            raise ValueError("Input trajectory must have at least 2 coordinate nodes.")
 
-        # Calculate localized angles from spatial deltas
-        dx = np.gradient(x, md)
-        dy = np.gradient(y, md)
-        dz = np.gradient(z, md)
+        # Calculate localized coordinate deltas with safe gradient divisions
+        d_md = np.diff(md)
+        d_md = np.where(np.abs(d_md) < 1e-5, 1e-5, d_md)  # Guard against duplicate survey nodes
+        d_md_full = np.concatenate([[d_md[0]], d_md])
+
+        dx = np.gradient(x) / d_md_full
+        dy = np.gradient(y) / d_md_full
+        dz = np.gradient(z) / d_md_full
 
         horizontal_displacement = np.sqrt(dx**2 + dy**2)
         inclination = np.arctan2(horizontal_displacement, -dz)  # Inclination from vertical
-        azimuth = np.arctan2(dy, dx)
+
+        # Calculate raw azimuth angles
+        azimuth_raw = np.arctan2(dy, dx)
+        # Self-Repair: Unwrapping is mathematically mandatory before calculating gradients
+        # to prevent spurious spikes when crossing the -pi/pi phase boundaries.
+        azimuth = np.unwrap(azimuth_raw)
 
         # Calculate local angular changes (Dogleg Severities)
-        d_inc = np.gradient(inclination, md)
-        d_azi = np.gradient(azimuth, md)
+        d_inc = np.gradient(inclination) / d_md_full
+        d_azi = np.gradient(azimuth) / d_md_full
 
-        # Smooth high-frequency oscillations to construct TQG index
+        # Compute tortuosity indices
         t_incline = np.abs(d_inc)
         t_azimuth = np.abs(d_azi * np.sin(inclination))
+        tqg_3d = np.sqrt(t_incline**2 + t_azimuth**2)
+
+        # Guard against NaNs in case of zero motion segments
+        tqg_3d = np.nan_to_num(tqg_3d, nan=0.0)
 
         df = pd.DataFrame({
             'md': md,
             'inclination': inclination,
-            'azimuth': azimuth,
-            't_incline': t_incline,
-            't_azimuth': t_azimuth,
-            'tqg_3d': np.sqrt(t_incline**2 + t_azimuth**2)
+            'azimuth': azimuth_raw,
+            't_inc': t_incline,
+            't_azi': t_azimuth,
+            'tqg_3d': tqg_3d
         })
 
         # Apply rolling window to capture cumulative localized tortuosity
@@ -224,15 +241,28 @@ class DynamicProgrammingTVTTracker:
     """
     Finds the globally optimal stratigraphic path aligning lateral GR to Typewell GR.
     Features robust penalties for structural transitions and geological faults.
+
+    Self-Repair features:
+    - Introduces `max_transition_step` to bound the transition search window,
+      reducing execution complexity from O(N * M^2) to O(N * M * W) and enforcing
+      geotechnical velocity limits.
+    - Robustly handles missing / NaN Gamma Ray readings.
     """
-    def __init__(self, lambda_smooth: float = 0.5, mu_fault: float = 2.0):
+    def __init__(self, lambda_smooth: float = 0.5, mu_fault: float = 2.0,
+                 max_transition_step: int = 15):
         self.lambda_smooth = lambda_smooth
         self.mu_fault = mu_fault
+        self.max_transition_step = max_transition_step
 
     def fit_path(self, lateral_gr: np.ndarray, typewell_gr: np.ndarray,
                  tvt_search_space: np.ndarray) -> np.ndarray:
+        # Self-Repair: Robustly fill NaN values in GR logs to prevent propagation failures
+        lateral_gr = np.nan_to_num(lateral_gr, nan=np.nanmedian(lateral_gr))
+        typewell_gr = np.nan_to_num(typewell_gr, nan=np.nanmedian(typewell_gr))
+
         N = len(lateral_gr)
         M = len(tvt_search_space)
+        W = self.max_transition_step
 
         # Cost Matrix initialization
         dp_matrix = np.full((N, M), np.inf)
@@ -242,19 +272,28 @@ class DynamicProgrammingTVTTracker:
         for j in range(M):
             dp_matrix[0, j] = (lateral_gr[0] - typewell_gr[j])**2
 
-        # Dynamic programming forward pass
+        # Dynamic programming forward pass with bounded search neighborhood
         for i in range(1, N):
             for j in range(M):
-                # Calculate cost transitions from all states in the previous step
-                # Transition cost: lambda * delta_j^2 + mu * |delta_j|
-                diffs = np.abs(np.arange(M) - j)
-                transition_costs = self.lambda_smooth * (diffs**2) + self.mu_fault * diffs
+                # Search neighborhood bounds [k_start, k_end]
+                k_start = max(0, j - W)
+                k_end = min(M - 1, j + W)
 
-                total_costs = dp_matrix[i-1, :] + transition_costs
-                best_state = np.argmin(total_costs)
+                best_cost = np.inf
+                best_k = k_start
 
-                dp_matrix[i, j] = (lateral_gr[i] - typewell_gr[j])**2 + total_costs[best_state]
-                backtrack_matrix[i, j] = best_state
+                # Iterating over the local transition band only
+                for k in range(k_start, k_end + 1):
+                    diff = abs(k - j)
+                    transition_cost = self.lambda_smooth * (diff**2) + self.mu_fault * diff
+                    total_cost = dp_matrix[i-1, k] + transition_cost
+
+                    if total_cost < best_cost:
+                        best_cost = total_cost
+                        best_k = k
+
+                dp_matrix[i, j] = (lateral_gr[i] - typewell_gr[j])**2 + best_cost
+                backtrack_matrix[i, j] = best_k
 
         # Backtracking pass to recover optimal path
         path = np.zeros(N, dtype=int)
@@ -273,34 +312,46 @@ class PrefixCalibrationEngine:
     """
     Simulates prediction performance on the known heel section to dynamically
     tune track blending weights per well.
+
+    Self-Repair features:
+    - Clip-based robust error normalization.
+    - Safe-weight distribution fallbacks in the case of numerical collapse.
     """
     def __init__(self, cuts=(0.5, 0.65, 0.75), gamma: float = 1.5):
         self.cuts = cuts
         self.gamma = gamma
 
     def calculate_weights(self, heel_df: pd.DataFrame, track_preds: list) -> np.ndarray:
-        """
-        heel_df: DataFrame of the visible heel with true 'tvt'
-        track_preds: list of prediction functions/models [f_track1, f_track2, f_track3]
-        """
         n = len(heel_df)
         num_tracks = len(track_preds)
         errors = np.zeros(num_tracks)
 
         for cut in self.cuts:
             cut_idx = int(n * cut)
+            if cut_idx < 10 or cut_idx >= n:
+                continue
             train_part = heel_df.iloc[:cut_idx]
             val_part = heel_df.iloc[cut_idx:]
 
             for t_idx, track in enumerate(track_preds):
-                pred = track(train_part, val_part)
-                rmse = np.sqrt(np.mean((pred - val_part['tvt'].values)**2))
-                errors[t_idx] += rmse
+                try:
+                    pred = track(train_part, val_part)
+                    # Handle any NaNs or Infinities in track predictions safely
+                    pred = np.nan_to_num(pred, nan=np.nanmedian(val_part['tvt'].values))
+                    rmse = np.sqrt(np.mean((pred - val_part['tvt'].values)**2))
+                    errors[t_idx] += rmse
+                except Exception:
+                    errors[t_idx] += 1e5  # Impose severe penalty on track failure
 
-        # Compute inverse-RMSE weighted contribution
-        inv_errors = 1.0 / (errors + 1e-6)
+        # Self-Repair: Robustly normalize weights and prevent division by zero or NaN propagation
+        inv_errors = 1.0 / (np.clip(errors, 1e-4, 1e7))
         weights = (inv_errors ** self.gamma)
-        return weights / np.sum(weights)
+        sum_weights = np.sum(weights)
+
+        if sum_weights < 1e-8 or np.isnan(sum_weights):
+            return np.ones(num_tracks) / num_tracks  # Secure uniform fallback weight
+
+        return weights / sum_weights
 ```
 
 ### 5.4 Physics-Constrained Kalman Filter Smoother
@@ -310,6 +361,11 @@ class PhysicsConstrainedKalmanSmoother:
     """
     Forward-backward Kalman smoother regularized by wellbore structural constraints
     and spatial dogleg limits.
+
+    Self-Repair features:
+    - Replaces naive matrix inversions with robust Moore-Penrose pseudo-inverses.
+    - Simplifies 1D scalar updates to avoid matrix dimensionality faults.
+    - Constrains state covariance using small epsilon-identity diagonal loading.
     """
     def __init__(self, process_noise: float = 0.05, measurement_noise: float = 1.5):
         self.Q = process_noise
@@ -317,40 +373,56 @@ class PhysicsConstrainedKalmanSmoother:
 
     def smooth(self, blended_tvt: np.ndarray, z: np.ndarray, tqg_index: np.ndarray) -> np.ndarray:
         n = len(blended_tvt)
-        smoothed_tvt = np.zeros(n)
+        if n == 0:
+            return blended_tvt
+
+        # Clean the input tortuosity index (fill NaNs and ensure non-negativity)
+        tqg_index = np.nan_to_num(tqg_index, nan=0.0)
+        tqg_index = np.clip(tqg_index, 0.0, None)
 
         # State variables: [TVT, TVT_velocity]
         x = np.array([blended_tvt[0], 0.0])
         P = np.eye(2) * 10.0
 
-        # State transition matrix (assuming smooth rate of change)
+        # State transition matrix
         F = np.array([[1.0, 1.0],
                       [0.0, 1.0]])
 
-        # Measurement matrix (we observe TVT)
+        # Measurement matrix (TVT observation)
         H = np.array([[1.0, 0.0]])
 
-        # Forward Pass
+        # Forward pass
         filtered_states = []
         filtered_covs = []
 
         for i in range(n):
-            # Dynamic process noise scaled by local tortuosity (high tortuosity = higher structural uncertainty)
+            # Dynamic process noise scaled by local well tortuosity
             Qi = np.array([[self.Q * (1.0 + tqg_index[i]), 0.0],
                            [0.0, self.Q * 0.1]])
 
-            # Predict
+            # Predict step
             x = F @ x
             P = F @ P @ F.T + Qi
 
-            # Update
+            # Measurement Update
             z_meas = blended_tvt[i]
-            y = z_meas - (H @ x)[0]
-            S = H @ P @ H.T + self.R
-            K = P @ H.T / S
+            y = z_meas - x[0]
 
-            x = x + K.flatten() * y
-            P = (np.eye(2) - K @ H) @ P
+            # Scalar computation for the residual covariance
+            S_val = P[0, 0] + self.R
+            if S_val < 1e-6:
+                S_val = 1e-6
+
+            # Compute Kalman gain directly to avoid division errors
+            K = P[:, 0] / S_val
+
+            x = x + K * y
+            # P = (I - K @ H) @ P
+            KH = np.outer(K, H[0])
+            P = (np.eye(2) - KH) @ P
+
+            # Self-Repair: Apply diagonal loading to enforce mathematical positive-definiteness
+            P += np.eye(2) * 1e-8
 
             filtered_states.append(x.copy())
             filtered_covs.append(P.copy())
@@ -358,7 +430,6 @@ class PhysicsConstrainedKalmanSmoother:
         # Backward smoothing pass (RTS Smoother)
         xsmooth = np.zeros((n, 2))
         xsmooth[-1] = filtered_states[-1]
-        Psmooth = filtered_covs[-1]
 
         for i in range(n-2, -1, -1):
             x_pred = F @ filtered_states[i]
@@ -366,7 +437,11 @@ class PhysicsConstrainedKalmanSmoother:
                            [0.0, self.Q * 0.1]])
             P_pred = F @ filtered_covs[i] @ F.T + Qi
 
-            C = filtered_covs[i] @ F.T @ np.linalg.inv(P_pred)
+            # Self-Repair: Use Moore-Penrose pseudo-inverse with small regularization diagonal loading
+            # to prevent singular matrix/division errors.
+            P_pred_reg = P_pred + np.eye(2) * 1e-7
+            C = filtered_covs[i] @ F.T @ np.linalg.pinv(P_pred_reg)
+
             xsmooth[i] = filtered_states[i] + C @ (xsmooth[i+1] - x_pred)
 
         return xsmooth[:, 0]
