@@ -447,6 +447,80 @@ class PhysicsConstrainedKalmanSmoother:
         return xsmooth[:, 0]
 ```
 
+### 5.5 Kaggle Environment Integration & Data Loader
+
+```python
+import os
+import glob
+from pathlib import Path
+
+class KagglePathResolver:
+    """
+    Kaggle environment path resolver and directory walker.
+    Traces competition trajectories and vertical typewell reference logs.
+    """
+    def __init__(self, data_dir_name: str = "rogii-wellbore-geology-prediction"):
+        self.data_dir_name = data_dir_name
+        self.possible_paths = [
+            Path(f"/kaggle/input/{self.data_dir_name}"),
+            Path(f"/kaggle/input/competitions/{self.data_dir_name}"),
+            Path(f"./{self.data_dir_name}"),
+            Path(".")
+        ]
+        self.active_path = self._resolve_active_path()
+
+    def _resolve_active_path(self) -> Path:
+        for path in self.possible_paths:
+            if path.exists() and (path / "train").exists():
+                print(f"[Kaggle Resolver] Active competition root found: {path.resolve()}")
+                return path
+        print("[Kaggle Resolver] Warning: Active competition root not found. Defaulting to current directory.")
+        return Path(".")
+
+    def get_train_wells(self) -> list:
+        train_dir = self.active_path / "train"
+        if not train_dir.exists():
+            return []
+
+        # Walk and pair trajectory with typewell by matching 8-character unique hash
+        wells = []
+        horizontal_wells = glob.glob(str(train_dir / "*__horizontal_well.csv"))
+        for hw_path in horizontal_wells:
+            hw_name = os.path.basename(hw_path)
+            well_hash = hw_name.split("__")[0]
+
+            tw_path = train_dir / f"{well_hash}__typewell.csv"
+            if tw_path.exists():
+                wells.append({
+                    "well_hash": well_hash,
+                    "horizontal_well": Path(hw_path),
+                    "typewell": tw_path
+                })
+        print(f"[Kaggle Resolver] Discovered and paired {len(wells)} training wells.")
+        return wells
+
+    def get_test_wells(self) -> list:
+        test_dir = self.active_path / "test"
+        if not test_dir.exists():
+            return []
+
+        wells = []
+        horizontal_wells = glob.glob(str(test_dir / "*__horizontal_well.csv"))
+        for hw_path in horizontal_wells:
+            hw_name = os.path.basename(hw_path)
+            well_hash = hw_name.split("__")[0]
+
+            tw_path = test_dir / f"{well_hash}__typewell.csv"
+            if tw_path.exists():
+                wells.append({
+                    "well_hash": well_hash,
+                    "horizontal_well": Path(hw_path),
+                    "typewell": tw_path
+                })
+        print(f"[Kaggle Resolver] Discovered and paired {len(wells)} evaluation wells.")
+        return wells
+```
+
 ---
 
 ## 6. Comprehensive Validation & Execution Strategy
